@@ -107,7 +107,7 @@ The UI and file persistence, which you probably don't want if you are rolling yo
  * chat.py
  * mesht_db.py
 
-An example that uses just the basic `mesht_device.py` and a transport:
+An example that uses just the basic `mesht_device.py` and a transport to send and receive messages, without any bookkeeping:
 ```py
 import asyncio
 
@@ -124,7 +124,6 @@ async def _wait_for_config_complete(device):
 
 
 async def run():
-
     from transport_serial import SerialTransport
     transport = SerialTransport(port="/dev/ttyACM0", baudrate=115200)
     # OR
@@ -160,6 +159,96 @@ async def run():
 
     finally:
         await device.close()
+
+
+asyncio.run(run())
+```
+
+An example of a simple bot that also uses MeshtDb to read previously sent messages, and pays attention to delivery receipts:
+```py
+
+import asyncio
+import os
+
+from mesht_device import MeshtDevice
+from mesht_db import MeshtDb
+from packet_parsing import parse_text_packet, parse_delivery_packet, is_dm_for
+from transport_serial import SerialTransport
+
+
+async def run():
+    #
+    # Build transport + DB facade.
+    #
+    transport = SerialTransport(port="/dev/tty.ttyACM0", baudrate=115200)
+    # OR:
+    # from transport_ble import BLETransport
+    # transport = BLETransport(address="77:88:99:AA:BB:CC", adapter="hci1")
+    # OR:
+    # from transport_tcp import TCPTransport
+    # transport = TCPTransport("1.2.3.4", 4403)
+
+    device = MeshtDevice(transport)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    db = MeshtDb(device, os.path.join(base_dir, "data"))
+    pending = {}
+
+    try:
+        #
+        # Start and wait for the startup config dump to complete.
+        #
+        await db.start()
+        await db.wait_for_config_complete()
+        if device.my_node_id == "00000000":
+            print("Could not resolve local node ID yet.")
+            return
+        print(f"My node id: {device.my_node_id}")
+        print("DM ping bot ready. Send 'ping' as DM to get 'pong'.")
+
+        #
+        # Main loop: handle DM ping and routing delivery reports.
+        #
+        while True:
+            fr = await db.next_fromradio()
+            pkt = (fr or {}).get("packet") or {}
+
+            # Handle delivery reports for our sent ping replies.
+            delivery = parse_delivery_packet(pkt)
+            if delivery is not None:
+                request_id = delivery.request_id
+                if request_id in pending:
+                    peer_hex = pending.pop(request_id)
+                    status = (delivery.status or "").upper()
+                    print(f"Delivery for {request_id} to {peer_hex}: {status}")
+
+            # Handle incoming direct text packets.
+            text_info = parse_text_packet(pkt)
+            if text_info is not None:
+                if not is_dm_for(text_info, device.my_node_id):
+                    continue
+
+                text = text_info.text or ""
+                print(f"DM from {text_info.sender_hex}: {text}")
+
+                if db.dm_looks_spoofed(text_info.sender_hex):
+                    print(f"Skipping reply to {text_info.sender_hex}: key changed in history")
+                    continue
+
+                # Show the stored DM history for this peer.
+                print(f"History with {text_info.sender_hex}:")
+                for msg in db.get_direct_messages(text_info.sender_hex):
+                    print(msg)
+
+                if text.strip().lower() != "ping":
+                    continue
+
+                sent = await db.send_direct_text("pong", int(text_info.sender_num))
+                message_id = int(sent.get("id") or 0)
+                pending[message_id] = text_info.sender_hex
+                print(f"Sent pong to {text_info.sender_hex}")
+
+    finally:
+        await db.close()
 
 
 asyncio.run(run())

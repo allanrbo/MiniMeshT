@@ -283,6 +283,52 @@ def test_meshtdb_direct_messages_include_key_events(tmp_path):
     asyncio.run(_run())
 
 
+def test_meshtdb_dm_looks_spoofed(tmp_path):
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        node_num = 0x465413D7
+        node_hex = f"{node_num & 0xFFFFFFFF:08x}"
+        frame_a = {"node_info": {"num": node_num, "user": {"public_key": b"a"}}}
+        frame_b = {"node_info": {"num": node_num, "user": {"public_key": b"b"}}}
+        await ft._recv_q.put(pb.encode(frame_a, FROMRADIO_SCHEMA))
+        await ft._recv_q.put(pb.encode(frame_b, FROMRADIO_SCHEMA))
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+
+        #
+        # Assert
+        #
+        assert db.dm_looks_spoofed(node_hex)
+        assert not db.dm_looks_spoofed("00000001")
+
+        await db.close()
+
+        db2 = MeshtDb(MeshtDevice(FakeTransport()), str(tmp_path))
+        assert db2.dm_looks_spoofed(node_hex)
+
+    asyncio.run(_run())
+
+
 def test_meshtdb_updates_rx_snr_from_packets(tmp_path):
     async def _run():
         #

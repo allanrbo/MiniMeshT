@@ -5,17 +5,16 @@ import asyncio
 import curses
 import datetime as dt
 import os
-import base64
 import sys
 import signal
 import time
 
-from mesht_device import MeshtDevice, PRESET_NAMES, REGION_NAMES, FROMRADIO_SCHEMA, TORADIO_SCHEMA, BROADCAST_NUM
+from mesht_device import MeshtDevice, PRESET_NAMES, REGION_NAMES
 from transport_ble import BLETransport
 from transport_serial import SerialTransport
 from transport_tcp import TCPTransport
 from mesht_db import MeshtDb
-import pb
+from packet_parsing import parse_text_packet, parse_delivery_packet, direct_peer_hex
 
 
 class ChatUI:
@@ -619,46 +618,6 @@ async def main_async(args):
             current_chat = target
             ui.current_chat = target
 
-        def _is_direct_packet(pkt):
-            to_num = pkt.get("to")
-            if to_num is None:
-                return False
-            return int(to_num) != BROADCAST_NUM
-
-        def _direct_peer_hex(pkt):
-            to_num = pkt.get("to")
-            from_num = pkt.get("from")
-            if to_num is None or from_num is None:
-                return None
-            if int(to_num) == BROADCAST_NUM:
-                return None
-            my_hex = device.my_node_id or ""
-            if my_hex == "00000000":
-                return None
-            try:
-                my_num = int(my_hex, 16)
-            except Exception:
-                return None
-            if from_num == my_num:
-                peer = to_num
-            elif to_num == my_num:
-                peer = from_num
-            else:
-                return None
-            return f"{peer & 0xFFFFFFFF:08x}"
-
-        def _direct_peer_hex_or_sender(pkt):
-            peer_hex = _direct_peer_hex(pkt)
-            if peer_hex is not None:
-                return peer_hex
-            sender = pkt.get("from")
-            if sender is not None:
-                return f"{sender & 0xFFFFFFFF:08x}"
-            to_num = pkt.get("to")
-            if to_num is None or int(to_num) == BROADCAST_NUM:
-                return None
-            return f"{int(to_num) & 0xFFFFFFFF:08x}"
-
         def update_status():
             parts = []
 
@@ -729,27 +688,13 @@ async def main_async(args):
                 if text:
                     ui.add_message(text, ts_epoch=msg.get("ts"))
                 return
-            raw = msg.get("raw_packet")
-            if not raw:
+            text = msg.get("text") or ""
+            if not text:
                 return
-            try:
-                buf = base64.b64decode(raw.encode("ascii"))
-            except Exception:
+            if current_chat is None:
                 return
-            decoded = pb.decode(buf, FROMRADIO_SCHEMA) if msg.get("type") == "FromRadio" else pb.decode(buf, TORADIO_SCHEMA)
-            pkt = (decoded or {}).get("packet") or {}
-            dec = pkt.get("decoded") or {}
-            if dec.get("portnum") != 1:
-                return
-            payload_b = dec.get("payload") or b""
-            if isinstance(payload_b, (bytes, bytearray)):
-                text = bytes(payload_b).decode("utf-8", errors="replace")
-            elif isinstance(payload_b, str):
-                text = payload_b
-            else:
-                text = ""
             ts = msg.get("ts")
-            is_direct = _is_direct_packet(pkt)
+            is_direct = current_chat[0] == "direct"
             status_suffix = ""
             if msg.get("type") == "ToRadio":
                 name = msg.get("sender_long_name") or msg.get("sender_short_name") or my_display_name()
@@ -770,19 +715,7 @@ async def main_async(args):
             else:
                 sender = msg.get("from")
                 name = resolve_sender_name(sender, msg)
-            if not text:
-                return
-            if current_chat is None:
-                return
-            chat_type, chat_id = current_chat
-            if is_direct:
-                peer_hex = _direct_peer_hex_or_sender(pkt)
-                if chat_type == "direct" and peer_hex == chat_id:
-                    ui.add_message(f"{name}: {text}", ts_epoch=ts, status_suffix=status_suffix)
-            else:
-                ch_idx = pkt.get("channel") or 0
-                if chat_type == "channel" and ch_idx == chat_id:
-                    ui.add_message(f"{name}: {text}", ts_epoch=ts, status_suffix=status_suffix)
+            ui.add_message(f"{name}: {text}", ts_epoch=ts, status_suffix=status_suffix)
 
         def reload_chat_messages():
             # Rebuild messages for the currently selected chat
@@ -827,25 +760,21 @@ async def main_async(args):
                     # Packet: render text messages for current chat; also refresh nodes view
                     if isinstance(fr, dict) and fr.get("packet"):
                         pkt = fr.get("packet") or {}
-                        dec = pkt.get("decoded") or {}
-                        if dec.get("portnum") == 1:
-                            payload = dec.get("payload") or b""
-                            if isinstance(payload, (bytes, bytearray)):
-                                text = bytes(payload).decode("utf-8", errors="replace")
-                            elif isinstance(payload, str):
-                                text = payload
-                            else:
-                                text = ""
+                        text_info = parse_text_packet(pkt)
+                        if text_info is not None:
+                            text = text_info.text or ""
                             ts = pkt.get("rx_time")
-                            sender = pkt.get("from")
-                            if sender is None:
-                                sender_hex = ""
-                            else:
-                                sender_hex = f"{sender & 0xFFFFFFFF:08x}"
+                            sender_hex = text_info.sender_hex or ""
                             name = resolve_sender_name(sender_hex)
                             if text:
-                                if _is_direct_packet(pkt):
-                                    peer_hex = _direct_peer_hex_or_sender(pkt)
+                                if text_info.is_direct:
+                                    peer_hex = direct_peer_hex(pkt, device.my_node_id)
+                                    if peer_hex is None:
+                                        peer_hex = sender_hex
+                                    if peer_hex is None:
+                                        to_num = text_info.to_num
+                                        if to_num is not None:
+                                            peer_hex = f"{int(to_num) & 0xFFFFFFFF:08x}"
                                     if current_chat is not None and current_chat[0] == "direct" and peer_hex == current_chat[1]:
                                         ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
                                         needs_redraw.set()
@@ -853,11 +782,11 @@ async def main_async(args):
                                         update_status()
                                         needs_redraw.set()
                                 else:
-                                    ch_idx = pkt.get("channel") or 0
+                                    ch_idx = text_info.channel or 0
                                     if current_chat is not None and current_chat[0] == "channel" and ch_idx == current_chat[1]:
                                         ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
                                         needs_redraw.set()
-                        elif dec.get("portnum") == 5:
+                        elif parse_delivery_packet(pkt) is not None:
                             # Routing updates can change [WAITING]/[ACK]/[FAILED] on sent messages.
                             reload_chat_messages()
                             needs_redraw.set()

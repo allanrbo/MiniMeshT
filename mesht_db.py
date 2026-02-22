@@ -8,7 +8,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 import pb
-from mesht_device import TORADIO_SCHEMA, FROMRADIO_SCHEMA, PORTNUMS, Channel, USER_SCHEMA, BROADCAST_NUM
+from mesht_device import TORADIO_SCHEMA, FROMRADIO_SCHEMA, PORTNUMS, Channel, USER_SCHEMA
+from packet_parsing import parse_text_packet, parse_delivery_packet, direct_peer_hex
 
 
 def _b64(s):
@@ -131,6 +132,15 @@ class MeshtDb:
         self._handle_from_radio(fr, raw)
         return fr
 
+    async def wait_for_config_complete(self):
+        # Wait for the startup config dump to finish.
+        if not self._in_startup:
+            return
+        while True:
+            fr = await self.next_fromradio()
+            if isinstance(fr, dict) and fr.get("config_complete_id") is not None:
+                return
+
     def _handle_from_radio(self, fr, raw):
         # Route and persist a single FromRadio dict
         # Detect end of startup handshake
@@ -150,7 +160,7 @@ class MeshtDb:
                 self._update_delivery_status_from_routing_packet(pkt)
             elif port_name == "TEXT_MESSAGE_APP":
                 entry = self._make_fromradio_entry(fr, raw)
-                peer_hex = self._direct_peer_hex(pkt)
+                peer_hex = direct_peer_hex(pkt, self.device.my_node_id)
                 if peer_hex:
                     msg_path = self._direct_messages_path(peer_hex)
                     _append_jsonl(msg_path, entry)
@@ -198,43 +208,16 @@ class MeshtDb:
 
     def _update_delivery_status_from_routing_packet(self, pkt):
         # Parse routing result and append an immutable delivery-status event.
-        decoded = pkt.get("decoded") or {}
-        request_id = decoded.get("request_id")
-        if request_id is None:
+        delivery = parse_delivery_packet(pkt)
+        if delivery is None:
             return
-        if int(request_id) <= 0:
-            return
-
-        payload = decoded.get("payload")
-        if not isinstance(payload, (bytes, bytearray)):
-            return
-
-        try:
-            routing = pb.decode(bytes(payload), [("int32", "error_reason", 3)]) or {}
-        except Exception:
-            return
-
-        error_reason = routing.get("error_reason")
-        # Only the error_reason routing variant maps to delivery status.
-        # Route request/reply routing packets do not carry ACK/FAIL results.
-        if error_reason is None:
-            return
-
-        status = "ack"
-        if int(error_reason) != 0:
-            status = "failed"
-
-        reporter = pkt.get("from")
-        reporter_hex = None
-        if reporter is not None:
-            reporter_hex = f"{int(reporter) & 0xFFFFFFFF:08x}"
 
         self._append_delivery_status_event(
-            request_id,
-            status,
-            int(error_reason),
+            delivery.request_id,
+            delivery.status,
+            delivery.error_reason,
             pkt.get("rx_time"),
-            reporter_hex,
+            delivery.reporter_hex,
         )
 
     def _append_delivery_status_event(self, message_id, status, error_reason, event_ts, reporter_hex):
@@ -348,6 +331,25 @@ class MeshtDb:
         combined.sort(key=lambda item: (item[0], item[1]))
         return [entry for _ts, _order, entry in combined]
 
+    def dm_looks_spoofed(self, node_id):
+        # If this node's public key changed in nodeinfo history, treat the DM
+        # identity as suspicious.
+        node_hex = (node_id or "").lower()
+        if not node_hex:
+            return False
+        path = os.path.join(self.data_dir, "nodeinfo.jsonl")
+        previous_key = None
+        for entry in _load_jsonl(path):
+            if (entry.get("ID") or "").lower() != node_hex:
+                continue
+            public_key = entry.get("public_key") or ""
+            if not public_key:
+                continue
+            if previous_key and public_key != previous_key:
+                return True
+            previous_key = public_key
+        return False
+
     def get_local_channel_indices(self):
         # Discover channels by scanning messages.<n>.jsonl files
         try:
@@ -396,14 +398,10 @@ class MeshtDb:
         node = self.node_info.get(sender_hex)
         short_name = node.short_name if node else ""
         long_name = node.long_name if node else ""
-        decoded = pkt.get("decoded") or {}
         text = ""
-        if PORTNUMS.get(decoded.get("portnum")) == "TEXT_MESSAGE_APP":
-            payload = decoded.get("payload") or b""
-            if isinstance(payload, (bytes, bytearray)):
-                text = bytes(payload).decode("utf-8", errors="replace")
-            elif isinstance(payload, str):
-                text = payload
+        parsed_text = parse_text_packet(pkt)
+        if parsed_text is not None:
+            text = parsed_text.text or ""
         return {
             "type": "FromRadio",
             "from": sender_hex,
@@ -426,14 +424,10 @@ class MeshtDb:
         raw = pb.encode(pkt_for_wire, TORADIO_SCHEMA)
 
         # Extract a readable message body when this is a text packet.
-        decoded = meshpacket.get("decoded") or {}
         text = ""
-        if PORTNUMS.get(decoded.get("portnum")) == "TEXT_MESSAGE_APP":
-            payload = decoded.get("payload") or b""
-            if isinstance(payload, (bytes, bytearray)):
-                text = bytes(payload).decode("utf-8", errors="replace")
-            elif isinstance(payload, str):
-                text = payload
+        parsed_text = parse_text_packet(meshpacket)
+        if parsed_text is not None:
+            text = parsed_text.text or ""
 
         # Mark new outbound packets as waiting until routing status updates.
         ts = int(time.time())
@@ -452,28 +446,6 @@ class MeshtDb:
     def _direct_messages_path(self, node_hex):
         node_hex = (node_hex or "").lower()
         return os.path.join(self.data_dir, f"messages.dm.{node_hex}.jsonl")
-
-    def _direct_peer_hex(self, pkt):
-        to_num = pkt.get("to")
-        from_num = pkt.get("from")
-        if to_num is None or int(to_num) == BROADCAST_NUM:
-            return None
-        if from_num is None:
-            return None
-        my_hex = self.device.my_node_id or ""
-        if my_hex == "00000000":
-            return f"{from_num & 0xFFFFFFFF:08x}"
-        try:
-            my_num = int(my_hex, 16)
-        except Exception:
-            return None
-        if from_num == my_num:
-            peer = to_num
-        elif to_num == my_num:
-            peer = from_num
-        else:
-            return None
-        return f"{peer & 0xFFFFFFFF:08x}"
 
     def _filter_text_entries(self, lines):
         out = []
