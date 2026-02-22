@@ -48,6 +48,9 @@ class ChatUI:
         curses.cbreak()
         self.stdscr.keypad(True)
         self.stdscr.nodelay(True)
+        if curses.has_colors():
+            curses.start_color()
+            curses.init_pair(30, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         try:
             curses.set_escdelay(25)
         except Exception:
@@ -62,13 +65,16 @@ class ChatUI:
         except Exception:
             pass
 
-    def add_message(self, line, ts_epoch=None):
-        # Use provided epoch seconds when valid; otherwise use current time
+    def add_message(self, line, ts_epoch=None, status_suffix=""):
+        # Build a structured message so text and delivery metadata stay separate until draw.
         if ts_epoch is not None:
             ts = dt.datetime.fromtimestamp(ts_epoch)
         else:
             ts = dt.datetime.now()
-        self.messages.append(f"[{ts.strftime('%Y-%m-%d %H:%M')}] {line}")
+        self.messages.append({
+            "base_text": f"[{ts.strftime('%Y-%m-%d %H:%M')}] {line}",
+            "status_suffix": status_suffix or "",
+        })
 
     def set_status(self, text):
         self.status = text
@@ -204,15 +210,42 @@ class ChatUI:
 
         # Prepare message lines with wrapping as needed
         wrapped = []
-        for line in self.messages:
-            if len(line) <= line_w:
-                wrapped.append(line)
-            else:
-                # simple wrap
-                start = 0
-                while start < len(line):
-                    wrapped.append(line[start : start + line_w])
-                    start += line_w
+        for entry in self.messages:
+            base_text = entry.get("base_text") or ""
+            status_suffix = entry.get("status_suffix") or ""
+            full_text = base_text + status_suffix
+            status_start = len(base_text)
+            if not status_suffix:
+                status_start = None
+
+            if len(full_text) <= line_w:
+                wrapped.append({
+                    "text": full_text,
+                    "status_start": status_start,
+                    "status_end": (len(full_text) if status_start is not None else None),
+                })
+                continue
+
+            # Wrap while preserving where the status segment lands in each wrapped row.
+            start = 0
+            total_len = len(full_text)
+            status_end = total_len
+            while start < total_len:
+                end = min(total_len, start + line_w)
+                segment_status_start = None
+                segment_status_end = None
+                if status_start is not None:
+                    overlap_start = max(start, status_start)
+                    overlap_end = min(end, status_end)
+                    if overlap_start < overlap_end:
+                        segment_status_start = overlap_start - start
+                        segment_status_end = overlap_end - start
+                wrapped.append({
+                    "text": full_text[start:end],
+                    "status_start": segment_status_start,
+                    "status_end": segment_status_end,
+                })
+                start = end
 
         # Determine viewport
         total = len(wrapped)
@@ -244,12 +277,24 @@ class ChatUI:
         if len(view) < msg_h_eff:
             inner_top += msg_h_eff - len(view)
 
-        for i, line in enumerate(view[:msg_h_eff]):
+        status_attr = curses.A_NORMAL
+        if curses.has_colors():
+            status_attr = curses.color_pair(30)
+
+        for i, row in enumerate(view[:msg_h_eff]):
             y = i + inner_top
             if y >= msg_h:
                 break
+            line = row.get("text") or ""
+            status_start = row.get("status_start")
+            status_end = row.get("status_end")
+
             try:
                 self.stdscr.addnstr(y, 0, line, line_w)
+                if status_start is not None and status_end is not None and status_start < status_end:
+                    if status_start < line_w:
+                        suffix_part = line[status_start:status_end]
+                        self.stdscr.addnstr(y, status_start, suffix_part, line_w - status_start, status_attr)
             except Exception:
                 pass
 
@@ -704,8 +749,24 @@ async def main_async(args):
             else:
                 text = ""
             ts = msg.get("ts")
+            is_direct = _is_direct_packet(pkt)
+            status_suffix = ""
             if msg.get("type") == "ToRadio":
                 name = msg.get("sender_long_name") or msg.get("sender_short_name") or my_display_name()
+                status = (msg.get("delivery_status") or "waiting").lower()
+                if status == "ack":
+                    if is_direct:
+                        status_suffix = "  [ACK]"
+                    else:
+                        ack_count = int(msg.get("delivery_ack_count") or 0)
+                        if ack_count > 0:
+                            status_suffix = f"  [{ack_count} ACK]"
+                        else:
+                            status_suffix = "  [ACK]"
+                elif status == "failed":
+                    status_suffix = "  [FAILED]"
+                else:
+                    status_suffix = "  [WAITING]"
             else:
                 sender = msg.get("from")
                 name = resolve_sender_name(sender, msg)
@@ -714,14 +775,14 @@ async def main_async(args):
             if current_chat is None:
                 return
             chat_type, chat_id = current_chat
-            if _is_direct_packet(pkt):
+            if is_direct:
                 peer_hex = _direct_peer_hex_or_sender(pkt)
                 if chat_type == "direct" and peer_hex == chat_id:
-                    ui.add_message(f"{name}: {text}", ts_epoch=ts)
+                    ui.add_message(f"{name}: {text}", ts_epoch=ts, status_suffix=status_suffix)
             else:
                 ch_idx = pkt.get("channel") or 0
                 if chat_type == "channel" and ch_idx == chat_id:
-                    ui.add_message(f"{name}: {text}", ts_epoch=ts)
+                    ui.add_message(f"{name}: {text}", ts_epoch=ts, status_suffix=status_suffix)
 
         def reload_chat_messages():
             # Rebuild messages for the currently selected chat
@@ -796,6 +857,10 @@ async def main_async(args):
                                     if current_chat is not None and current_chat[0] == "channel" and ch_idx == current_chat[1]:
                                         ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
                                         needs_redraw.set()
+                        elif dec.get("portnum") == 5:
+                            # Routing updates can change [WAITING]/[ACK]/[FAILED] on sent messages.
+                            reload_chat_messages()
+                            needs_redraw.set()
                         # While viewing nodes, reflect last-heard changes promptly
                         if ui.mode == "nodes":
                             needs_redraw.set()

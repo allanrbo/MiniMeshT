@@ -84,10 +84,13 @@ class MeshtDb:
         self._last_lora = None
         # Node info cache keyed by 8-char lowercase hex ID
         self._node_info = {}
+        # Message ID -> jsonl file path for fast delivery-status appends.
+        self._message_path_by_id = {}
         # Suppress nodeinfo compaction during startup handshake until config_complete_id
         self._in_startup = True
 
         self._load_node_info()
+        self._load_message_path_index()
 
     @property
     def node_info(self):
@@ -109,6 +112,7 @@ class MeshtDb:
         entry = self._make_toradio_entry(pkt)
         msg_path = os.path.join(self.data_dir, f"messages.{int(channel_index)}.jsonl")
         _append_jsonl(msg_path, entry)
+        self._remember_message_path(pkt.get("id"), msg_path)
         return pkt
 
     async def send_direct_text(self, text, destination):
@@ -117,6 +121,7 @@ class MeshtDb:
         node_hex = f"{int(destination) & 0xFFFFFFFF:08x}"
         msg_path = self._direct_messages_path(node_hex)
         _append_jsonl(msg_path, entry)
+        self._remember_message_path(pkt.get("id"), msg_path)
         return pkt
 
     async def next_fromradio(self):
@@ -141,7 +146,9 @@ class MeshtDb:
             pkt = fr.get("packet") or {}
             decoded = pkt.get("decoded")
             port_name = PORTNUMS.get((decoded or {}).get("portnum")) if decoded else None
-            if port_name == "TEXT_MESSAGE_APP":
+            if port_name == "ROUTING_APP":
+                self._update_delivery_status_from_routing_packet(pkt)
+            elif port_name == "TEXT_MESSAGE_APP":
                 entry = self._make_fromradio_entry(fr, raw)
                 peer_hex = self._direct_peer_hex(pkt)
                 if peer_hex:
@@ -188,6 +195,91 @@ class MeshtDb:
     @property
     def lora_config(self):
         return self._last_lora
+
+    def _update_delivery_status_from_routing_packet(self, pkt):
+        # Parse routing result and append an immutable delivery-status event.
+        decoded = pkt.get("decoded") or {}
+        request_id = decoded.get("request_id")
+        if request_id is None:
+            return
+        if int(request_id) <= 0:
+            return
+
+        payload = decoded.get("payload")
+        if not isinstance(payload, (bytes, bytearray)):
+            return
+
+        try:
+            routing = pb.decode(bytes(payload), [("int32", "error_reason", 3)]) or {}
+        except Exception:
+            return
+
+        error_reason = routing.get("error_reason")
+        # Only the error_reason routing variant maps to delivery status.
+        # Route request/reply routing packets do not carry ACK/FAIL results.
+        if error_reason is None:
+            return
+
+        status = "ack"
+        if int(error_reason) != 0:
+            status = "failed"
+
+        reporter = pkt.get("from")
+        reporter_hex = None
+        if reporter is not None:
+            reporter_hex = f"{int(reporter) & 0xFFFFFFFF:08x}"
+
+        self._append_delivery_status_event(
+            request_id,
+            status,
+            int(error_reason),
+            pkt.get("rx_time"),
+            reporter_hex,
+        )
+
+    def _append_delivery_status_event(self, message_id, status, error_reason, event_ts, reporter_hex):
+        # Find the chat log containing this sent message ID.
+        path = self._message_path_by_id.get(int(message_id))
+        if path is None:
+            return
+
+        # Persist an immutable status event in append-only form.
+        ts = int(event_ts) if event_ts else int(time.time())
+        entry = {
+            "type": "DeliveryStatus",
+            "message_id": int(message_id),
+            "delivery_status": status,
+            "error_reason": int(error_reason),
+            "ts": ts,
+            "tsh": _fmt_ts(ts),
+        }
+        if reporter_hex:
+            entry["from"] = reporter_hex
+        _append_jsonl(path, entry)
+
+    def _remember_message_path(self, message_id, path):
+        if message_id is None:
+            return
+        self._message_path_by_id[int(message_id)] = path
+
+    def _load_message_path_index(self):
+        # Build message-id -> file map once at startup.
+        try:
+            names = os.listdir(self.data_dir)
+        except Exception:
+            return
+
+        for name in names:
+            if not name.startswith("messages.") or not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(self.data_dir, name)
+            for entry in _load_jsonl(path):
+                if entry.get("type") != "ToRadio":
+                    continue
+                message_id = entry.get("message_id")
+                if message_id is None:
+                    continue
+                self._remember_message_path(message_id, path)
 
     def _load_node_info(self):
         # Load node info history and build last-known cache
@@ -328,8 +420,12 @@ class MeshtDb:
         me = self._node_info.get(self.device.my_node_id)
         short_name = me.short_name if me else ""
         long_name = me.long_name if me else ""
+
+        # Encode exactly what was sent so logs can be replayed/decoded later.
         pkt_for_wire = {"packet": dict(meshpacket)}
         raw = pb.encode(pkt_for_wire, TORADIO_SCHEMA)
+
+        # Extract a readable message body when this is a text packet.
         decoded = meshpacket.get("decoded") or {}
         text = ""
         if PORTNUMS.get(decoded.get("portnum")) == "TEXT_MESSAGE_APP":
@@ -338,14 +434,18 @@ class MeshtDb:
                 text = bytes(payload).decode("utf-8", errors="replace")
             elif isinstance(payload, str):
                 text = payload
+
+        # Mark new outbound packets as waiting until routing status updates.
+        ts = int(time.time())
         return {
             "type": "ToRadio",
             "from": self.device.my_node_id,
-            "ts": int(time.time()),
-            "tsh": _fmt_ts(int(time.time())),
+            "ts": ts,
+            "tsh": _fmt_ts(ts),
             "text": text,
             "sender_short_name": short_name,
             "sender_long_name": long_name,
+            "message_id": meshpacket.get("id"),
             "raw_packet": _b64(raw),
         }
 
@@ -377,7 +477,34 @@ class MeshtDb:
 
     def _filter_text_entries(self, lines):
         out = []
-        # Iterate in file order (oldest to newest)
+        status_state_by_message_id = {}
+
+        # Collect status events for each message ID.
+        for entry in lines:
+            if entry.get("type") != "DeliveryStatus":
+                continue
+            message_id = entry.get("message_id")
+            if message_id is None:
+                continue
+            status = (entry.get("delivery_status") or "").lower()
+            if status not in {"waiting", "ack", "failed"}:
+                continue
+            mid = int(message_id)
+            st = status_state_by_message_id.get(mid)
+            if st is None:
+                st = {
+                    "saw_failed": False,
+                    "ack_nodes": set(),
+                }
+                status_state_by_message_id[mid] = st
+            if status == "failed":
+                st["saw_failed"] = True
+            elif status == "ack":
+                sender_hex = (entry.get("from") or "").lower()
+                if sender_hex:
+                    st["ack_nodes"].add(sender_hex)
+
+        # Iterate text messages in file order (oldest to newest).
         for entry in lines:
             et = entry.get("type")
             if et not in {"FromRadio", "ToRadio"}:
@@ -392,6 +519,25 @@ class MeshtDb:
                 d = pkt.get("decoded") if pkt else None
                 if not d or PORTNUMS.get(d.get("portnum")) != "TEXT_MESSAGE_APP":
                     continue
+
+            if et == "ToRadio":
+                message_id = entry.get("message_id")
+                resolved = "waiting"
+                ack_count = 0
+                if message_id is not None:
+                    st = status_state_by_message_id.get(int(message_id))
+                    if st is not None:
+                        ack_count = len(st.get("ack_nodes") or set())
+                        if ack_count > 0:
+                            resolved = "ack"
+                        elif st.get("saw_failed"):
+                            resolved = "failed"
+                text_entry = dict(entry)
+                text_entry["delivery_status"] = resolved
+                text_entry["delivery_ack_count"] = ack_count
+                out.append(text_entry)
+                continue
+
             out.append(entry)
         return out
 
