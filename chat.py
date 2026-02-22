@@ -10,7 +10,7 @@ import sys
 import signal
 import time
 
-from mesht_device import MeshtDevice, PRESET_NAMES, REGION_NAMES, FROMRADIO_SCHEMA, TORADIO_SCHEMA
+from mesht_device import MeshtDevice, PRESET_NAMES, REGION_NAMES, FROMRADIO_SCHEMA, TORADIO_SCHEMA, BROADCAST_NUM
 from transport_ble import BLETransport
 from transport_serial import SerialTransport
 from transport_tcp import TCPTransport
@@ -21,22 +21,26 @@ import pb
 class ChatUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
-        # Messages for the currently selected channel (formatted lines)
+        # Messages for the currently selected chat (formatted lines)
         self.messages = []
         self.input_buf = []
         self.status = ""
         self.scroll_offset = 0
         self.mode = "chat"  # "chat" or "nodes"
-        self.current_channel_index = 0
-        self.switch_channel = None  # +1 for next, -1 for prev
+        self.current_chat = None  # ("channel", index) or ("direct", node_hex)
+        self.switch_chat = None  # +1 for next, -1 for prev
         # Track last-rendered state for stable scrolling
         self._last_view_height = None
         self._last_wrapped_count = 0
         self._last_size = None
-        self._last_channel_index = None
+        self._last_chat_key = None
+        self._last_nodes_order = []
+        self._last_nodes_count = 0
         # Node list sorting (default: LastHeard desc)
         self.nodes_sort_key = "last"
         self.nodes_sort_reverse = True
+        self.nodes_selected = 0
+        self.open_dm_node = None
 
     def setup(self):
         curses.curs_set(1)
@@ -80,15 +84,18 @@ class ChatUI:
         if ch == 7:
             self.mode = "nodes" if self.mode == "chat" else "chat"
             self.scroll_offset = 0
+            self.open_dm_node = None
+            if self.mode == "nodes":
+                self.nodes_selected = 0
             return None
 
         if self.mode == "chat":
-            # Ctrl+N (14) next channel, Ctrl+P (16) previous channel
+            # Ctrl+N (14) next chat, Ctrl+P (16) previous chat
             if ch == 14:
-                self.switch_channel = 1
+                self.switch_chat = 1
                 return None
             if ch == 16:
-                self.switch_channel = -1
+                self.switch_chat = -1
                 return None
             if ch in (curses.KEY_ENTER, 10, 13):
                 # Return a completed line when Enter is pressed
@@ -152,23 +159,31 @@ class ChatUI:
                     self.nodes_sort_reverse = default_rev
                 self.scroll_offset = 0
                 return None
+            count = int(self._last_nodes_count or 0)
+            if count <= 0:
+                return None
+            if ch in (curses.KEY_ENTER, 10, 13):
+                if 0 <= self.nodes_selected < len(self._last_nodes_order):
+                    node_hex = self._last_nodes_order[self.nodes_selected]
+                    if node_hex:
+                        self.open_dm_node = node_hex
+                        self.mode = "chat"
+                        self.scroll_offset = 0
+                return None
             if ch == curses.KEY_UP:
-                # Move toward top
-                self.scroll_offset = max(0, self.scroll_offset - 1)
+                self.nodes_selected = max(0, self.nodes_selected - 1)
             elif ch == curses.KEY_DOWN:
-                # Move toward bottom; clamped in draw_nodes
-                self.scroll_offset += 1
+                self.nodes_selected = min(count - 1, self.nodes_selected + 1)
             elif ch == curses.KEY_PPAGE:
                 step = max(1, (self._last_view_height or self._page_size()) - 1)
-                self.scroll_offset = max(0, self.scroll_offset - step)
+                self.nodes_selected = max(0, self.nodes_selected - step)
             elif ch == curses.KEY_NPAGE:
                 step = max(1, (self._last_view_height or self._page_size()) - 1)
-                self.scroll_offset += step
+                self.nodes_selected = min(count - 1, self.nodes_selected + step)
             elif ch == curses.KEY_HOME:
-                self.scroll_offset = 0
+                self.nodes_selected = 0
             elif ch == curses.KEY_END:
-                # Large value; draw_nodes clamps to bottom
-                self.scroll_offset = 1_000_000_000
+                self.nodes_selected = count - 1
             return None
 
     def _page_size(self):
@@ -176,7 +191,7 @@ class ChatUI:
         # minus status and input lines
         return max(1, h - 3)
 
-    def draw_messages(self, channels):
+    def draw_messages(self, channels, node_info):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         size = (h, w)
@@ -205,7 +220,7 @@ class ChatUI:
         # Keep viewport anchored while scrolled: if new lines arrive and we're not at bottom,
         # increase scroll_offset by the number of newly wrapped lines so the view stays fixed.
         resized = size != (self._last_size or size)
-        chan_changed = self._last_channel_index is not None and self._last_channel_index != self.current_channel_index
+        chan_changed = self._last_chat_key is not None and self._last_chat_key != self.current_chat
         if self.scroll_offset > 0 and not resized and not chan_changed and total > self._last_wrapped_count:
             self.scroll_offset += (total - self._last_wrapped_count)
 
@@ -245,16 +260,23 @@ class ChatUI:
             pass
 
         # Input line
-        cur_idx = self.current_channel_index
-        cur_name = None
-        if cur_idx is not None:
-            cur_name = f"Channel {cur_idx}"
-            for c in channels:
-                if c.index == cur_idx:
-                    cur_name = c.name or cur_name
-                    break
-        else:
-            cur_name = "Channel ?"
+        cur_name = "No chat"
+        cur_chat = self.current_chat
+        if cur_chat is not None:
+            chat_type, chat_id = cur_chat
+            if chat_type == "channel":
+                cur_name = f"Channel {chat_id}"
+                for c in channels:
+                    if c.index == chat_id:
+                        cur_name = c.name or cur_name
+                        break
+            elif chat_type == "direct":
+                node = node_info.get(chat_id) if isinstance(node_info, dict) else None
+                display = node.display_name() if node else ""
+                if display:
+                    cur_name = f"DM: {display}"
+                else:
+                    cur_name = f"DM: {(chat_id or '').upper()}"
         prompt = f"[{cur_name}] > "
         input_text = self.get_input_text()
         try:
@@ -272,9 +294,9 @@ class ChatUI:
         self.scroll_offset = min(max(0, offset), max(0, total))
         self._last_wrapped_count = total
         self._last_size = size
-        self._last_channel_index = self.current_channel_index
+        self._last_chat_key = self.current_chat
 
-    def draw_nodes(self, node_items):
+    def draw_nodes(self, node_items, dm_counts):
         # node_items: iterable of (node_id_hex, NodeInfo)
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -289,6 +311,7 @@ class ChatUI:
         # Build data rows from node info
         nodes = []
         for nid, ni in node_items:
+            nid_hex = (nid or "").lower()
             short = ni.short_name or ""
             long = ni.long_name or ""
             hops = ni.hops_away
@@ -297,10 +320,15 @@ class ChatUI:
             last = ni.last_heard
             batt = ni.battery_level
             volt = ni.voltage
+            dm_count = 0
+            if isinstance(dm_counts, dict):
+                dm_count = int(dm_counts.get(nid_hex, 0) or 0)
             nodes.append({
                 "id": (nid or "").upper(),
+                "id_hex": nid_hex,
                 "short": short,
                 "long": long,
+                "dm_count": dm_count,
                 "hops": hops,
                 "rx_snr": round(rx_snr, 1) if rx_snr is not None else None,
                 "rx_rssi": rx_rssi,
@@ -353,12 +381,13 @@ class ChatUI:
                 return ""
 
         # Build header and formatted rows
-        # Columns: ID, Short name, Long name, Hops, SNR, RSSI, LastHeard, Batt, Volt
+        # Columns: ID, Short name, Long name, DMs, Hops, SNR, RSSI, LastHeard, Batt, Volt
         # Allocate simple widths; truncate as needed
         cols = [
             ("ID", 8),
             ("Short name", 10),
             ("Long name", max(10, w // 5)),
+            ("DMs", 4),
             ("Hops", 4),
             ("SNR", 5),
             ("RSSI", 6),
@@ -381,7 +410,7 @@ class ChatUI:
                 return str(s)
 
         # Right-align numeric-like columns for readability
-        numeric_cols = {"Hops", "SNR", "RSSI", "Batt%", "Volt"}
+        numeric_cols = {"DMs", "Hops", "SNR", "RSSI", "Batt%", "Volt"}
 
         def fmt_row(values):
             parts = []
@@ -405,6 +434,7 @@ class ChatUI:
                         r["id"],
                         r["short"],
                         r["long"],
+                        r["dm_count"],
                         ("" if r["hops"] is None else r["hops"]),
                         ("" if r["rx_snr"] is None else r["rx_snr"]),
                         ("" if r["rx_rssi"] is None else r["rx_rssi"]),
@@ -417,7 +447,18 @@ class ChatUI:
 
         # Determine viewport with scroll (top-anchored)
         total = len(data_rows)
+        self._last_nodes_count = total
+        if total <= 0:
+            self.nodes_selected = 0
+            self._last_nodes_order = []
+        else:
+            self.nodes_selected = min(max(0, self.nodes_selected), total - 1)
+            self._last_nodes_order = [entry.get("id_hex") or "" for entry in nodes]
         max_off = max(0, total - table_h)
+        if self.nodes_selected < self.scroll_offset:
+            self.scroll_offset = self.nodes_selected
+        elif self.nodes_selected > self.scroll_offset + table_h - 1:
+            self.scroll_offset = self.nodes_selected - table_h + 1
         if self.scroll_offset < 0:
             self.scroll_offset = 0
         if self.scroll_offset > max_off:
@@ -427,7 +468,7 @@ class ChatUI:
         view = data_rows[start_idx:end_idx]
 
         # Instruction line at top
-        instr = "Esc/Ctrl+G exit  |  Sort: Shift+I ID  Shift+S Short  Shift+L Long  Shift+H Hops  Shift+N SNR  Shift+R RSSI  Shift+T LastHeard (toggle to reverse)"
+        instr = "Enter: DM  |  Esc/Ctrl+G exit  |  Sort: Shift+I ID  Shift+S Short  Shift+L Long  Shift+H Hops  Shift+N SNR  Shift+R RSSI  Shift+T LastHeard (toggle to reverse)"
         try:
             self.stdscr.addnstr(0, 0, instr.ljust(w), line_w, curses.A_REVERSE)
         except Exception:
@@ -442,7 +483,11 @@ class ChatUI:
         for i, line in enumerate(view):
             y = i + 2
             try:
-                self.stdscr.addnstr(y, 0, line, line_w)
+                row_idx = start_idx + i
+                if row_idx == self.nodes_selected:
+                    self.stdscr.addnstr(y, 0, line, line_w, curses.A_REVERSE)
+                else:
+                    self.stdscr.addnstr(y, 0, line, line_w)
             except Exception:
                 pass
 
@@ -474,12 +519,12 @@ async def main_async(args):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = args.data_dir or os.path.join(base_dir, "data")
     db = MeshtDb(device, data_dir)
-    channel_index = None
+    current_chat = None
 
     connected = False
     try:
         ui.set_status("Connecting...")
-        ui.draw_messages([])
+        ui.draw_messages([], {})
         # Try to start DB (which starts the device and recv loop)
         try:
             logger.debug("chat: initial db.start()")
@@ -489,9 +534,85 @@ async def main_async(args):
         except Exception as e:
             connected = False
             logger.warning("chat: initial db.start() failed: %r", e)
-        # Choose first available channel (device when connected, else from files)
+        # Choose first available chat target (channel or DMs)
         lora_preset_name = None
         lora_region_name = None
+
+        def my_display_name():
+            me = db.node_info.get(device.my_node_id)
+            if me is None:
+                return "You"
+            name = me.display_name()
+            return name or "You"
+
+        def resolve_sender_name(sender, meta=None):
+            if isinstance(meta, dict):
+                n = meta.get("sender_long_name") or meta.get("sender_short_name")
+                if n:
+                    return n
+            node_info = db.node_info.get(sender)
+            if node_info is not None:
+                name = node_info.display_name()
+                if name:
+                    return name
+            # Fallback to hex formatting without prefix
+            return sender.upper() or "00000000"
+
+        def get_chat_targets():
+            targets = []
+            for c in db.get_channels():
+                targets.append(("channel", c.index))
+            dm_nodes = db.get_direct_nodes()
+            if current_chat is not None and current_chat[0] == "direct" and current_chat[1] not in dm_nodes:
+                dm_nodes.append(current_chat[1])
+            for node_hex in sorted({n for n in dm_nodes}):
+                targets.append(("direct", node_hex))
+            return targets
+
+        def set_current_chat(target):
+            nonlocal current_chat
+            current_chat = target
+            ui.current_chat = target
+
+        def _is_direct_packet(pkt):
+            to_num = pkt.get("to")
+            if to_num is None:
+                return False
+            return int(to_num) != BROADCAST_NUM
+
+        def _direct_peer_hex(pkt):
+            to_num = pkt.get("to")
+            from_num = pkt.get("from")
+            if to_num is None or from_num is None:
+                return None
+            if int(to_num) == BROADCAST_NUM:
+                return None
+            my_hex = device.my_node_id or ""
+            if my_hex == "00000000":
+                return None
+            try:
+                my_num = int(my_hex, 16)
+            except Exception:
+                return None
+            if from_num == my_num:
+                peer = to_num
+            elif to_num == my_num:
+                peer = from_num
+            else:
+                return None
+            return f"{peer & 0xFFFFFFFF:08x}"
+
+        def _direct_peer_hex_or_sender(pkt):
+            peer_hex = _direct_peer_hex(pkt)
+            if peer_hex is not None:
+                return peer_hex
+            sender = pkt.get("from")
+            if sender is not None:
+                return f"{sender & 0xFFFFFFFF:08x}"
+            to_num = pkt.get("to")
+            if to_num is None or int(to_num) == BROADCAST_NUM:
+                return None
+            return f"{int(to_num) & 0xFFFFFFFF:08x}"
 
         def update_status():
             parts = []
@@ -500,14 +621,24 @@ async def main_async(args):
             chan_parts = []
             for c in db.get_channels():
                 name = c.name or f"Channel {c.index}"
-                label = f" {name} "
-                if c.index == ui.current_channel_index:
+                label = name
+                if current_chat is not None and current_chat[0] == "channel" and current_chat[1] == c.index:
                     label = f"[{name}]"
                 chan_parts.append(label)
-            chan_str = " ".join(chan_parts)
-            if chan_str:
-                chan_str += " (Ctrl+N/P to switch)"
-                parts.append(chan_str)
+            dm_nodes = db.get_direct_nodes()
+            if current_chat is not None and current_chat[0] == "direct" and current_chat[1] not in dm_nodes:
+                dm_nodes.append(current_chat[1])
+            if dm_nodes:
+                if current_chat is not None and current_chat[0] == "direct":
+                    name = resolve_sender_name(current_chat[1])
+                    chan_parts.append(f"[DM:{name}]")
+                else:
+                    chan_parts.append("DM")
+            if chan_parts:
+                parts.append("Channels: " + " ".join(chan_parts))
+
+            if chan_parts:
+                parts.append("Ctrl+N/P to switch")
 
             # Summary of current modem settings
             config_msg = []
@@ -543,31 +674,16 @@ async def main_async(args):
             set_lora_labels(lc)
             update_status()
 
-        indices = [c.index for c in db.get_channels()]
-        channel_index = indices[0] if indices else None
-        ui.current_channel_index = channel_index
-
-        def my_display_name():
-            me = db.node_info.get(device.my_node_id)
-            if me is None:
-                return "You"
-            name = me.display_name()
-            return name or "You"
-
-        def resolve_sender_name(sender, meta=None):
-            if isinstance(meta, dict):
-                n = meta.get("sender_long_name") or meta.get("sender_short_name")
-                if n:
-                    return n
-            node_info = db.node_info.get(sender)
-            if node_info is not None:
-                name = node_info.display_name()
-                if name:
-                    return name
-            # Fallback to hex formatting without prefix
-            return sender.upper() or "00000000"
+        targets = get_chat_targets()
+        set_current_chat(targets[0] if targets else None)
+        update_status()
 
         def _render_message(msg):
+            if msg.get("type") in ("Warning", "KeyInfo"):
+                text = msg.get("text") or ""
+                if text:
+                    ui.add_message(text, ts_epoch=msg.get("ts"))
+                return
             raw = msg.get("raw_packet")
             if not raw:
                 return
@@ -581,27 +697,49 @@ async def main_async(args):
             if dec.get("portnum") != 1:
                 return
             payload_b = dec.get("payload") or b""
-            text = payload_b.decode("utf-8", errors="replace")
-            ch_idx = pkt.get("channel") or 0
+            if isinstance(payload_b, (bytes, bytearray)):
+                text = bytes(payload_b).decode("utf-8", errors="replace")
+            elif isinstance(payload_b, str):
+                text = payload_b
+            else:
+                text = ""
             ts = msg.get("ts")
             if msg.get("type") == "ToRadio":
                 name = msg.get("sender_long_name") or msg.get("sender_short_name") or my_display_name()
             else:
                 sender = msg.get("from")
                 name = resolve_sender_name(sender, msg)
-            # Append only if it's for the currently selected channel
-            if text and ch_idx == ui.current_channel_index:
-                ui.add_message(f"{name}: {text}", ts_epoch=ts)
+            if not text:
+                return
+            if current_chat is None:
+                return
+            chat_type, chat_id = current_chat
+            if _is_direct_packet(pkt):
+                peer_hex = _direct_peer_hex_or_sender(pkt)
+                if chat_type == "direct" and peer_hex == chat_id:
+                    ui.add_message(f"{name}: {text}", ts_epoch=ts)
+            else:
+                ch_idx = pkt.get("channel") or 0
+                if chat_type == "channel" and ch_idx == chat_id:
+                    ui.add_message(f"{name}: {text}", ts_epoch=ts)
 
-        def reload_channel_messages():
-            # Rebuild messages for the currently selected channel
+        def reload_chat_messages():
+            # Rebuild messages for the currently selected chat
             ui.messages = []
-            recent = db.get_messages(channel=ui.current_channel_index)
+            if current_chat is None:
+                return
+            chat_type, chat_id = current_chat
+            if chat_type == "channel":
+                recent = db.get_messages(channel=chat_id)
+            elif chat_type == "direct":
+                recent = db.get_direct_messages(chat_id)
+            else:
+                return
             for msg in recent:
                 _render_message(msg)
 
-        # Initial load of recent messages for current channel
-        reload_channel_messages()
+        # Initial load of recent messages for current chat
+        reload_chat_messages()
 
         # Event-driven input handling and redraws
         loop = asyncio.get_running_loop()
@@ -625,7 +763,7 @@ async def main_async(args):
                         needs_redraw.set()
                         # Pause reads until connection_worker marks connected again
                         continue
-                    # Packet: render text messages for current channel; also refresh nodes view
+                    # Packet: render text messages for current chat; also refresh nodes view
                     if isinstance(fr, dict) and fr.get("packet"):
                         pkt = fr.get("packet") or {}
                         dec = pkt.get("decoded") or {}
@@ -637,7 +775,6 @@ async def main_async(args):
                                 text = payload
                             else:
                                 text = ""
-                            ch_idx = pkt.get("channel") or 0
                             ts = pkt.get("rx_time")
                             sender = pkt.get("from")
                             if sender is None:
@@ -645,16 +782,27 @@ async def main_async(args):
                             else:
                                 sender_hex = f"{sender & 0xFFFFFFFF:08x}"
                             name = resolve_sender_name(sender_hex)
-                            if text and ch_idx == ui.current_channel_index:
-                                ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
-                                needs_redraw.set()
+                            if text:
+                                if _is_direct_packet(pkt):
+                                    peer_hex = _direct_peer_hex_or_sender(pkt)
+                                    if current_chat is not None and current_chat[0] == "direct" and peer_hex == current_chat[1]:
+                                        ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
+                                        needs_redraw.set()
+                                    if peer_hex:
+                                        update_status()
+                                        needs_redraw.set()
+                                else:
+                                    ch_idx = pkt.get("channel") or 0
+                                    if current_chat is not None and current_chat[0] == "channel" and ch_idx == current_chat[1]:
+                                        ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
+                                        needs_redraw.set()
                         # While viewing nodes, reflect last-heard changes promptly
                         if ui.mode == "nodes":
                             needs_redraw.set()
                         continue
                     # Node info updates: names may change -> rebuild messages
                     if isinstance(fr, dict) and fr.get("node_info"):
-                        reload_channel_messages()
+                        reload_chat_messages()
                         needs_redraw.set()
                         continue
                     # Config updates: reflect LoRa region/preset
@@ -697,45 +845,59 @@ async def main_async(args):
             pass
 
         async def input_worker():
-            nonlocal channel_index
+            nonlocal current_chat
             try:
                 while True:
                     ch = await key_queue.get()
                     line = ui.handle_key(ch)
+                    if ui.open_dm_node:
+                        set_current_chat(("direct", ui.open_dm_node))
+                        ui.open_dm_node = None
+                        ui.scroll_offset = 0
+                        update_status()
+                        reload_chat_messages()
+                        needs_redraw.set()
                     if line is not None and line:
                         if not connected:
                             ui.set_status("Offline: cannot send")
-                        elif channel_index is None:
-                            ui.set_status("Not sent: no channel selected")
+                        elif current_chat is None:
+                            ui.set_status("Not sent: no chat selected")
                         else:
                             try:
-                                await db.send_text(line, channel_index)
-                                reload_channel_messages()
+                                chat_type, chat_id = current_chat
+                                if chat_type == "channel":
+                                    await db.send_text(line, chat_id)
+                                elif chat_type == "direct":
+                                    await db.send_direct_text(line, int(chat_id, 16))
+                                else:
+                                    ui.set_status("Select a DM to send")
+                                    needs_redraw.set()
+                                    continue
+                                reload_chat_messages()
                                 needs_redraw.set()
                             except Exception as e:
                                 ui.set_status(f"Send error: {e}")
-                    # Handle Ctrl+N / Ctrl+P channel switching
-                    if ui.switch_channel is not None and ui.mode == "chat":
-                        indices = [c.index for c in db.get_channels()]
-                        if indices:
-                            if channel_index is None or channel_index not in indices:
-                                channel_index = indices[0]
+                    # Handle Ctrl+N / Ctrl+P chat switching
+                    if ui.switch_chat is not None and ui.mode == "chat":
+                        targets = get_chat_targets()
+                        if targets:
+                            if current_chat is None or current_chat not in targets:
+                                set_current_chat(targets[0])
                             else:
-                                pos = indices.index(channel_index)
-                                pos = (pos + ui.switch_channel) % len(indices)
-                                channel_index = indices[pos]
-                            ui.current_channel_index = channel_index
+                                pos = targets.index(current_chat)
+                                pos = (pos + ui.switch_chat) % len(targets)
+                                set_current_chat(targets[pos])
                             ui.scroll_offset = 0
                             update_status()
-                            # Rebuild messages for selected channel
-                            reload_channel_messages()
-                        ui.switch_channel = None
+                            # Rebuild messages for selected chat
+                            reload_chat_messages()
+                        ui.switch_chat = None
                     needs_redraw.set()
             except asyncio.CancelledError:
                 return
 
         async def draw_worker():
-            nonlocal channel_index
+            nonlocal current_chat
             try:
                 while True:
                     await needs_redraw.wait()
@@ -753,15 +915,24 @@ async def main_async(args):
                         pass
                     chs = db.get_channels()
                     if ui.mode == "chat":
-                        enabled_indices = {c.index for c in chs}
-                        if channel_index not in enabled_indices:
-                            sorted_enabled = sorted(enabled_indices)
-                            channel_index = sorted_enabled[0] if sorted_enabled else None
-                            ui.current_channel_index = channel_index
+                        targets = get_chat_targets()
+                        if current_chat is None:
+                            set_current_chat(targets[0] if targets else None)
+                            ui.scroll_offset = 0
                             update_status()
-                        ui.draw_messages(chs)
+                            reload_chat_messages()
+                        elif current_chat[0] == "channel" and current_chat not in targets:
+                            set_current_chat(targets[0] if targets else None)
+                            ui.scroll_offset = 0
+                            update_status()
+                            reload_chat_messages()
+                        ui.draw_messages(chs, db.node_info)
                     elif ui.mode == "nodes":
-                        ui.draw_nodes(db.node_info.items())
+                        # Build DM counts for node list display.
+                        dm_counts = {}
+                        for node_hex in db.get_direct_nodes():
+                            dm_counts[node_hex] = len(db.get_direct_messages(node_hex))
+                        ui.draw_nodes(db.node_info.items(), dm_counts)
             except asyncio.CancelledError:
                 return
 

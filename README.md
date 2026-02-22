@@ -13,7 +13,6 @@ Use it to chat, explore the mesh, or as a lightweight basis for your own tools.
  * Pretty minimal dependencies: just `bleak` for Bluetooth, `pyserial-asyncio` for serial ports, and `pytest`.
  * Ships with a minimal Protobuf encoder/decoder (~550 lines excluding comments and blanks. Also available standalone: [pb.py](https://github.com/allanrbo/pb.py/)).
  * Hackable base: ~1,200 lines of Python. Easy to fork and extend.
- * Deliberately does not support DMs. Their security model are thoroughly broken anyway. See e.g. <a href="https://meshmarauder.net/">Meshmarauder</a>.
 
 ![Illustration of laptop running MiniMeshT](./readme_graphics/laptop.jpeg)
 
@@ -25,9 +24,12 @@ Also has a screen to list detected nodes:
 | Keys   | Action           |
 |--------|------------------|
 | Ctrl+G | View node list   |
-| Ctrl+N | Next channel     |
-| Ctrl+P | Previous channel |
+| Ctrl+N | Next chat        |
+| Ctrl+P | Previous chat    |
 | Ctrl+C | Exit             |
+| Enter | Open DM (node list) |
+
+Direct messages appear inline in the channel strip as `DM` (or `[DM:Name]` when selected). Use Ctrl+G to open the node list, move with arrow keys, and press Enter to open a DM thread. The node list shows a `DMs` column with the count of DMs for each node.
 
 ## Running
 
@@ -145,6 +147,11 @@ async def run():
             return
         print(f"Sending text to channel '{channel_name}'")
         await device.send_text("Hello world", idx)
+
+        # Sending a DM:
+        dm_node_id = 0x12345678
+        print(f"Sending DM to {dm_node_id:08x}")
+        await device.send_direct_text("Hello DM", dm_node_id)
 
         # Receiving (all messages types):
         while True:

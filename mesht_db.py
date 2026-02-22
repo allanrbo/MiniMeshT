@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import time
@@ -7,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import pb
-from mesht_device import TORADIO_SCHEMA, FROMRADIO_SCHEMA, PORTNUMS, Channel, USER_SCHEMA
+from mesht_device import TORADIO_SCHEMA, FROMRADIO_SCHEMA, PORTNUMS, Channel, USER_SCHEMA, BROADCAST_NUM
 
 
 def _b64(s):
@@ -110,6 +111,14 @@ class MeshtDb:
         _append_jsonl(msg_path, entry)
         return pkt
 
+    async def send_direct_text(self, text, destination):
+        pkt = await self.device.send_direct_text(text, destination)
+        entry = self._make_toradio_entry(pkt)
+        node_hex = f"{int(destination) & 0xFFFFFFFF:08x}"
+        msg_path = self._direct_messages_path(node_hex)
+        _append_jsonl(msg_path, entry)
+        return pkt
+
     async def next_fromradio(self):
         # Read from the device, ingest, persist, and return decoded frame
         fr, raw = await self.device.recv()
@@ -134,9 +143,14 @@ class MeshtDb:
             port_name = PORTNUMS.get((decoded or {}).get("portnum")) if decoded else None
             if port_name == "TEXT_MESSAGE_APP":
                 entry = self._make_fromradio_entry(fr, raw)
-                ch_idx = pkt.get("channel") or 0
-                msg_path = os.path.join(self.data_dir, f"messages.{int(ch_idx)}.jsonl")
-                _append_jsonl(msg_path, entry)
+                peer_hex = self._direct_peer_hex(pkt)
+                if peer_hex:
+                    msg_path = self._direct_messages_path(peer_hex)
+                    _append_jsonl(msg_path, entry)
+                else:
+                    ch_idx = pkt.get("channel") or 0
+                    msg_path = os.path.join(self.data_dir, f"messages.{int(ch_idx)}.jsonl")
+                    _append_jsonl(msg_path, entry)
             elif port_name == "NODEINFO_APP":
                 self._ingest_packet_nodeinfo(pkt, raw)
 
@@ -205,24 +219,24 @@ class MeshtDb:
             lines = _load_jsonl(path)
         else:
             lines = []
-        out = []
-        # Iterate in file order (oldest to newest)
-        for entry in lines:
-            et = entry.get("type")
-            if et not in {"FromRadio", "ToRadio"}:
-                continue
-            if et == "FromRadio":
-                raw = entry.get("raw_packet")
-                if not raw:
-                    continue
-                buf = base64.b64decode(raw.encode("ascii"))
-                decoded = pb.decode(buf, FROMRADIO_SCHEMA)
-                pkt = (decoded or {}).get("packet") or {}
-                d = pkt.get("decoded") if pkt else None
-                if not d or PORTNUMS.get(d.get("portnum")) != "TEXT_MESSAGE_APP":
-                    continue
-            out.append(entry)
-        return out
+        return self._filter_text_entries(lines)
+
+    def get_direct_messages(self, node_id):
+        node_hex = (node_id or "").lower()
+        path = self._direct_messages_path(node_hex)
+        lines = _load_jsonl(path)
+        messages = self._filter_text_entries(lines)
+        key_events = self._build_key_events(node_hex)
+        combined = []
+        order = 0
+        for entry in messages:
+            combined.append((int(entry.get("ts") or 0), order, entry))
+            order += 1
+        for entry in key_events:
+            combined.append((int(entry.get("ts") or 0), order, entry))
+            order += 1
+        combined.sort(key=lambda item: (item[0], item[1]))
+        return [entry for _ts, _order, entry in combined]
 
     def get_local_channel_indices(self):
         # Discover channels by scanning messages.<n>.jsonl files
@@ -239,6 +253,21 @@ class MeshtDb:
                 out.append(int(mid))
             except Exception:
                 pass
+        return sorted({i for i in out})
+
+    def get_direct_nodes(self):
+        # Discover direct-message peers by scanning messages.dm.<id>.jsonl files
+        try:
+            names = os.listdir(self.data_dir)
+        except Exception:
+            names = []
+        out = []
+        for n in names:
+            if not n.startswith("messages.dm.") or not n.endswith(".jsonl"):
+                continue
+            mid = n[len("messages.dm."):-len(".jsonl")]
+            if mid:
+                out.append(mid.lower())
         return sorted({i for i in out})
 
     def get_channels(self):
@@ -301,6 +330,52 @@ class MeshtDb:
             "sender_long_name": long_name,
             "raw_packet": _b64(raw),
         }
+
+    def _direct_messages_path(self, node_hex):
+        node_hex = (node_hex or "").lower()
+        return os.path.join(self.data_dir, f"messages.dm.{node_hex}.jsonl")
+
+    def _direct_peer_hex(self, pkt):
+        to_num = pkt.get("to")
+        from_num = pkt.get("from")
+        if to_num is None or int(to_num) == BROADCAST_NUM:
+            return None
+        if from_num is None:
+            return None
+        my_hex = self.device.my_node_id or ""
+        if my_hex == "00000000":
+            return f"{from_num & 0xFFFFFFFF:08x}"
+        try:
+            my_num = int(my_hex, 16)
+        except Exception:
+            return None
+        if from_num == my_num:
+            peer = to_num
+        elif to_num == my_num:
+            peer = from_num
+        else:
+            return None
+        return f"{peer & 0xFFFFFFFF:08x}"
+
+    def _filter_text_entries(self, lines):
+        out = []
+        # Iterate in file order (oldest to newest)
+        for entry in lines:
+            et = entry.get("type")
+            if et not in {"FromRadio", "ToRadio"}:
+                continue
+            if et == "FromRadio":
+                raw = entry.get("raw_packet")
+                if not raw:
+                    continue
+                buf = base64.b64decode(raw.encode("ascii"))
+                decoded = pb.decode(buf, FROMRADIO_SCHEMA)
+                pkt = (decoded or {}).get("packet") or {}
+                d = pkt.get("decoded") if pkt else None
+                if not d or PORTNUMS.get(d.get("portnum")) != "TEXT_MESSAGE_APP":
+                    continue
+            out.append(entry)
+        return out
 
     def _ingest_packet_nodeinfo(self, packet, raw):
         """
@@ -429,6 +504,7 @@ class MeshtDb:
             return
         last_state = {}
         last_index = {}
+        first_index = {}
         keep = set()
         index_info = {}
 
@@ -442,6 +518,8 @@ class MeshtDb:
                 continue
 
             last_index[node_id] = i
+            if node_id not in first_index:
+                first_index[node_id] = i
             st = (short_name, long_name, pubkey_b64)
             index_info[i] = (node_id, st)
             if node_id not in last_state:
@@ -465,6 +543,8 @@ class MeshtDb:
             node_id, st = ni
             newest_st = newest_state_by_node.get(node_id)
             newest_idx = newest_index_by_node.get(node_id)
+            if first_index.get(node_id) == i:
+                continue
             if newest_st is not None and st == newest_st and newest_idx is not None and i != newest_idx:
                 to_drop.add(i)
         if to_drop:
@@ -480,3 +560,50 @@ class MeshtDb:
                     json.dump(obj, f, separators=(",", ":"))
                     f.write("\n")
         os.replace(tmp_path, path)
+
+    def _build_key_events(self, node_hex):
+        events = []
+        if not node_hex:
+            return events
+        path = os.path.join(self.data_dir, "nodeinfo.jsonl")
+        if not os.path.exists(path):
+            return events
+
+        last_fp = None
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("ID") != node_hex:
+                    continue
+                public_key = entry.get("public_key")
+                if not public_key:
+                    continue
+                key_bytes = base64.b64decode(public_key)
+                fp = hashlib.sha256(key_bytes).hexdigest().upper()
+                ts = int(entry.get("ts") or 0)
+                if last_fp is None:
+                    events.append({
+                        "type": "KeyInfo",
+                        "ts": ts,
+                        "tsh": _fmt_ts(ts),
+                        "text": f"Public key SHA-256: {fp}",
+                    })
+                    last_fp = fp
+                    continue
+                if fp != last_fp:
+                    events.append({
+                        "type": "Warning",
+                        "ts": ts,
+                        "tsh": _fmt_ts(ts),
+                        "text": (
+                            "WARNING! KEY CHANGED! SOMEONE MAY BE SPOOFING THIS NODE, AND MAY BE ABLE TO "
+                            "DECODE MESSAGES YOU SEND FROM HERE ON! NEW KEY SHA-256: "
+                            f"{fp}"
+                        ),
+                    })
+                    last_fp = fp
+
+        return events

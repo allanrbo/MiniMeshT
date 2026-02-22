@@ -184,6 +184,7 @@ PORTNUMS = {
     511: "MAX",
 }
 NAMES_TO_PORTNUMS = {v: k for k, v in PORTNUMS.items()}
+BROADCAST_NUM = 0xFFFFFFFF
 
 
 class Channel:
@@ -211,6 +212,12 @@ class MeshtDevice:
         return await self.transport.close()
 
     async def send_text(self, text, channel_index):
+        return await self._send_text(text, channel_index, BROADCAST_NUM)
+
+    async def send_direct_text(self, text, destination):
+        return await self._send_text(text, 0, int(destination))
+
+    async def _send_text(self, text, channel_index, destination):
         data = {
             "portnum": NAMES_TO_PORTNUMS["TEXT_MESSAGE_APP"],
             "payload": text.encode("utf-8"),
@@ -218,7 +225,7 @@ class MeshtDevice:
         }
         meshpacket = {
             "id": random.randint(1, 0x7FFFFFFF),
-            "to": 0xFFFFFFFF,
+            "to": int(destination),
             "channel": int(channel_index),
             "want_ack": True,
             "decoded": data,

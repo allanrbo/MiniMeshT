@@ -150,6 +150,46 @@ def test_send_text_raises_on_unknown_channel():
     asyncio.run(_run())
 
 
+def test_send_direct_text_sets_destination_and_channel():
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        await dev.start()
+        # Drain startup frames so channels are known
+        async def _drain_handshake():
+            while True:
+                fr, _ = await asyncio.wait_for(dev.recv(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    break
+        await _drain_handshake()
+
+        #
+        # Act
+        #
+        await dev.send_direct_text("hello", 0x1234ABCD)
+
+        #
+        # Assert
+        #
+        assert len(ft.sent) >= 1
+        tr = pb.decode(ft.sent[-1], TORADIO_SCHEMA)
+        assert isinstance(tr, dict)
+        pkt = tr.get("packet")
+        assert isinstance(pkt, dict)
+        assert pkt.get("to") == 0x1234ABCD
+        assert pkt.get("channel") == 0
+        decoded = pkt.get("decoded")
+        assert isinstance(decoded, dict)
+        assert decoded.get("payload") == b"hello"
+
+        await dev.close()
+
+    asyncio.run(_run())
+
+
 def test_recv_updates_lora_config_cache():
     async def _run():
         #

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import time
@@ -76,6 +77,154 @@ def test_radio_db_persists_ingested_text(tmp_path):
         with open(msgs_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         assert any('"type":"FromRadio"' in ln for ln in lines)
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_radio_db_persists_direct_text(tmp_path):
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        # Inject one direct text FromRadio (to our node 1)
+        fr = {
+            "packet": {
+                "from": 2,
+                "to": 1,
+                "channel": 0,
+                "rx_time": int(time.time()),
+                "decoded": {"portnum": 1, "payload": b"hi"},
+            }
+        }
+        await ft._recv_q.put(pb.encode(fr, FROMRADIO_SCHEMA))
+
+        async def _drain_until_text():
+            while True:
+                frm = await db.next_fromradio()
+                pkt = (frm or {}).get("packet") or {}
+                dec = pkt.get("decoded") or {}
+                if dec.get("portnum") == 1 and pkt.get("to") == 1:
+                    break
+
+        await asyncio.wait_for(_drain_until_text(), timeout=1.0)
+
+        #
+        # Assert
+        #
+        msgs_path = os.path.join(str(tmp_path), "messages.dm.00000002.jsonl")
+        assert os.path.exists(msgs_path)
+        with open(msgs_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        assert any('"type":"FromRadio"' in ln for ln in lines)
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_meshtdb_send_direct_text_persists(tmp_path):
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        #
+        # Act
+        #
+        await db.send_direct_text("hello", 2)
+
+        #
+        # Assert
+        #
+        msgs_path = os.path.join(str(tmp_path), "messages.dm.00000002.jsonl")
+        assert os.path.exists(msgs_path)
+        with open(msgs_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        assert any('"type":"ToRadio"' in ln for ln in lines)
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_meshtdb_direct_messages_include_key_events(tmp_path):
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        node_num = 0x465413D7
+        frame_a = {"node_info": {"num": node_num, "user": {"public_key": b"a"}}}
+        frame_b = {"node_info": {"num": node_num, "user": {"public_key": b"b"}}}
+        await ft._recv_q.put(pb.encode(frame_a, FROMRADIO_SCHEMA))
+        await ft._recv_q.put(pb.encode(frame_b, FROMRADIO_SCHEMA))
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+        node_hex = f"{node_num & 0xFFFFFFFF:08x}"
+        messages = db.get_direct_messages(node_hex)
+
+        #
+        # Assert
+        #
+        info = None
+        warning = None
+        for entry in messages:
+            if entry.get("type") == "KeyInfo":
+                info = entry
+            if entry.get("type") == "Warning":
+                warning = entry
+        assert info is not None
+        assert warning is not None
+        expected_info_fp = hashlib.sha256(b"a").hexdigest().upper()
+        expected_warn_fp = hashlib.sha256(b"b").hexdigest().upper()
+        assert f"Public key SHA-256: {expected_info_fp}" in info.get("text", "")
+        assert f"NEW KEY SHA-256: {expected_warn_fp}" in warning.get("text", "")
 
         await db.close()
 
@@ -404,6 +553,55 @@ def test_nodeinfo_compaction_keeps_first_changes_newest(tmp_path):
             ("n1x", "NodeOneX", "Yg=="),           # newest (and change) kept
         ]
         assert got == expected
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_nodeinfo_compaction_keeps_first_and_newest_if_identical(tmp_path):
+    async def _run():
+        #
+        # Arrange
+        #
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        node_num = 0x11111111
+        frame = {"node_info": {"num": node_num, "user": {"long_name": "Same", "short_name": "same", "public_key": b"a"}}}
+        await ft._recv_q.put(pb.encode(frame, FROMRADIO_SCHEMA))
+        await ft._recv_q.put(pb.encode(frame, FROMRADIO_SCHEMA))
+        await ft._recv_q.put(pb.encode(frame, FROMRADIO_SCHEMA))
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+
+        #
+        # Assert
+        #
+        node_hex = f"{node_num & 0xFFFFFFFF:08x}"
+        node_path = os.path.join(str(tmp_path), "nodeinfo.jsonl")
+        with open(node_path, "r", encoding="utf-8") as f:
+            entries = [json.loads(ln) for ln in f if ln.strip()]
+        entries = [e for e in entries if e.get("ID") == node_hex]
+        assert len(entries) == 2
+        assert entries[0].get("public_key") == "YQ=="
+        assert entries[-1].get("public_key") == "YQ=="
 
         await db.close()
 
