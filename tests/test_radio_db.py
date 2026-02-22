@@ -43,6 +43,54 @@ class FakeTransport:
         return await self._recv_q.get()
 
 
+def test_meshtdb_loads_nodeinfo_metrics_from_disk(tmp_path):
+    #
+    # Arrange
+    #
+    node_path = os.path.join(str(tmp_path), "nodeinfo.jsonl")
+    with open(node_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "ID": "00000001",
+                "short_name": "n1",
+                "long_name": "Node One",
+                "user_id": "!abc",
+                "hops_away": 3,
+                "rx_snr": 5.5,
+                "rx_rssi": -97,
+                "last_heard": 1700000000,
+                "battery_level": 88,
+                "voltage": 3.91,
+            },
+            f,
+            separators=(",", ":"),
+        )
+        f.write("\n")
+
+    ft = FakeTransport()
+    dev = MeshtDevice(ft)
+
+    #
+    # Act
+    #
+    db = MeshtDb(dev, str(tmp_path))
+    node = db.node_info.get("00000001")
+
+    #
+    # Assert
+    #
+    assert node is not None
+    assert node.short_name == "n1"
+    assert node.long_name == "Node One"
+    assert node.user_id == "!abc"
+    assert node.hops_away == 3
+    assert node.rx_snr == 5.5
+    assert node.rx_rssi == -97
+    assert node.last_heard == 1700000000
+    assert node.battery_level == 88
+    assert node.voltage == 3.91
+
+
 def test_radio_db_persists_ingested_text(tmp_path):
     async def _run():
         #
@@ -682,7 +730,7 @@ def test_meshtdb_ingests_nodeinfo_packets(tmp_path):
 
         await db.close()
 
-        # Assert reload uses stored fields rather than raw packets
+        # Assert reload restores fields we persisted in nodeinfo.jsonl
         dev2 = MeshtDevice(FakeTransport())
         db2 = MeshtDb(dev2, str(tmp_path))
         cached = db2.node_info.get(node_hex)
@@ -692,8 +740,8 @@ def test_meshtdb_ingests_nodeinfo_packets(tmp_path):
         assert cached.node_id == node_hex
         assert cached.user_id == "!unit-test"
         assert cached.public_key == pk_b64
-        assert cached.last_heard is None
-        assert cached.rx_snr is None
-        assert cached.rx_rssi is None
+        assert cached.last_heard == now
+        assert cached.rx_snr == 9.5
+        assert cached.rx_rssi == -107
 
     asyncio.run(_run())

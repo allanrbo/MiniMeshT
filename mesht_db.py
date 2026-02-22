@@ -212,6 +212,24 @@ class MeshtDb:
             user_id = entry.get("user_id")
             if user_id:
                 node.user_id = user_id
+            hops_away = entry.get("hops_away")
+            if hops_away is not None:
+                node.hops_away = hops_away
+            rx_snr = entry.get("rx_snr")
+            if rx_snr is not None:
+                node.rx_snr = rx_snr
+            rx_rssi = entry.get("rx_rssi")
+            if rx_rssi is not None:
+                node.rx_rssi = rx_rssi
+            last_heard = entry.get("last_heard")
+            if last_heard is not None:
+                node.last_heard = last_heard
+            battery_level = entry.get("battery_level")
+            if battery_level is not None:
+                node.battery_level = battery_level
+            voltage = entry.get("voltage")
+            if voltage is not None:
+                node.voltage = voltage
 
     def get_messages(self, channel=None):
         if channel is not None:
