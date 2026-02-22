@@ -550,24 +550,6 @@ class MeshtDb:
         for nid, idx in last_index.items():
             keep.add(idx)
 
-        # Drop earlier entries that are identical to the newest state (keep only newest copy)
-        newest_state_by_node = last_state
-        newest_index_by_node = last_index
-        to_drop = set()
-        for i in list(keep):
-            ni = index_info.get(i)
-            if not ni:
-                continue
-            node_id, st = ni
-            newest_st = newest_state_by_node.get(node_id)
-            newest_idx = newest_index_by_node.get(node_id)
-            if first_index.get(node_id) == i:
-                continue
-            if newest_st is not None and st == newest_st and newest_idx is not None and i != newest_idx:
-                to_drop.add(i)
-        if to_drop:
-            keep.difference_update(to_drop)
-
         if len(keep) == len(entries):
             return
 

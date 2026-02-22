@@ -599,6 +599,7 @@ def test_nodeinfo_compaction_keeps_first_changes_newest(tmp_path):
             ("n1x", "NodeOne", "YQ=="),            # change: short_name
             ("n1x", "NodeOneX", "YQ=="),           # change: long_name
             ("n1x", "NodeOneX", "Yg=="),           # newest (and change) kept
+            ("n1x", "NodeOneX", "Yg=="),           # newest duplicate
         ]
         assert got == expected
 
@@ -650,6 +651,76 @@ def test_nodeinfo_compaction_keeps_first_and_newest_if_identical(tmp_path):
         assert len(entries) == 2
         assert entries[0].get("public_key") == "YQ=="
         assert entries[-1].get("public_key") == "YQ=="
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_nodeinfo_compaction_keeps_reversion_change_marker(tmp_path, monkeypatch):
+    async def _run():
+        #
+        # Arrange
+        #
+        tick = {"value": 2000000000}
+
+        def _fake_time():
+            tick["value"] += 1
+            return tick["value"]
+
+        monkeypatch.setattr("mesht_db.time.time", _fake_time)
+
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        node_num = 0x22222222
+        node_hex = f"{node_num & 0xFFFFFFFF:08x}"
+        frames = [
+            {"node_info": {"num": node_num, "user": {"public_key": b"a"}}},
+            {"node_info": {"num": node_num, "user": {"public_key": b"b"}}},
+            {"node_info": {"num": node_num, "user": {"public_key": b"a"}}},
+            {"node_info": {"num": node_num, "user": {"public_key": b"a"}}},
+        ]
+        for fr in frames:
+            await ft._recv_q.put(pb.encode(fr, FROMRADIO_SCHEMA))
+
+        async def _drain(n):
+            seen = 0
+            while seen < n:
+                fr = await db.next_fromradio()
+                if isinstance(fr, dict) and fr.get("node_info"):
+                    seen += 1
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(_drain(len(frames)), timeout=1.0)
+        events = db.get_direct_messages(node_hex)
+
+        #
+        # Assert
+        #
+        node_path = os.path.join(str(tmp_path), "nodeinfo.jsonl")
+        with open(node_path, "r", encoding="utf-8") as f:
+            entries = [json.loads(ln) for ln in f if ln.strip()]
+        entries = [e for e in entries if e.get("ID") == node_hex]
+        assert [e.get("public_key") for e in entries] == ["YQ==", "Yg==", "YQ==", "YQ=="]
+
+        warnings = [e for e in events if e.get("type") == "Warning"]
+        assert len(warnings) == 2
+        assert warnings[-1].get("ts") == entries[2].get("ts")
+        assert warnings[-1].get("ts") != entries[3].get("ts")
 
         await db.close()
 
