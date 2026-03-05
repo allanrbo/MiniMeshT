@@ -66,9 +66,13 @@ class ChatUI:
 
     def add_message(self, line, ts_epoch=None, status_suffix=""):
         # Build a structured message so text and delivery metadata stay separate until draw.
-        if ts_epoch is not None:
-            ts = dt.datetime.fromtimestamp(ts_epoch)
-        else:
+        ts = None
+        if isinstance(ts_epoch, (int, float)):
+            candidate = int(ts_epoch)
+            now = int(time.time())
+            if candidate > 0 and candidate <= now + 300:
+                ts = dt.datetime.fromtimestamp(candidate)
+        if ts is None:
             ts = dt.datetime.now()
         self.messages.append({
             "base_text": f"[{ts.strftime('%Y-%m-%d %H:%M')}] {line}",

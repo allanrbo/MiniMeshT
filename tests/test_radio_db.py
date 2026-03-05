@@ -1139,3 +1139,116 @@ def test_meshtdb_ingests_nodeinfo_packets(tmp_path):
         assert cached.rx_rssi == -107
 
     asyncio.run(_run())
+
+
+def test_meshtdb_clamps_future_rx_time_for_received_text(tmp_path, monkeypatch):
+    async def _run():
+        #
+        # Arrange
+        #
+        now = 1772688420
+        monkeypatch.setattr("mesht_db.time.time", lambda: now)
+
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        frame = {
+            "packet": {
+                "from": 2,
+                "to": 1,
+                "channel": 0,
+                "rx_time": now + 90000,
+                "decoded": {
+                    "portnum": NAMES_TO_PORTNUMS["TEXT_MESSAGE_APP"],
+                    "payload": b"future",
+                },
+            }
+        }
+        await ft._recv_q.put(pb.encode(frame, FROMRADIO_SCHEMA))
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+
+        #
+        # Assert
+        #
+        messages = db.get_direct_messages("00000002")
+        received = [m for m in messages if m.get("type") == "FromRadio" and m.get("text") == "future"]
+        assert received
+        assert received[-1].get("ts") == now
+
+        node = db.node_info.get("00000002")
+        assert node is not None
+        assert node.last_heard == now
+
+        await db.close()
+
+    asyncio.run(_run())
+
+
+def test_meshtdb_clamps_future_rx_time_for_delivery_status(tmp_path, monkeypatch):
+    async def _run():
+        #
+        # Arrange
+        #
+        now = 1772688420
+        monkeypatch.setattr("mesht_db.time.time", lambda: now)
+
+        ft = FakeTransport()
+        dev = MeshtDevice(ft)
+        db = MeshtDb(dev, str(tmp_path))
+        await db.start()
+
+        async def _drain_startup():
+            while True:
+                fr = await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+                if isinstance(fr, dict) and fr.get("config_complete_id"):
+                    return
+
+        await _drain_startup()
+
+        pkt = await db.send_text("hello", 0)
+        routing_payload = pb.encode({"error_reason": 0}, ROUTING_SCHEMA)
+        frame = {
+            "packet": {
+                "from": 2,
+                "to": 1,
+                "rx_time": now + 90000,
+                "decoded": {
+                    "portnum": NAMES_TO_PORTNUMS["ROUTING_APP"],
+                    "request_id": pkt.get("id"),
+                    "payload": routing_payload,
+                },
+            }
+        }
+        await ft._recv_q.put(pb.encode(frame, FROMRADIO_SCHEMA))
+
+        #
+        # Act
+        #
+        await asyncio.wait_for(db.next_fromradio(), timeout=1.0)
+
+        #
+        # Assert
+        #
+        with open(os.path.join(str(tmp_path), "messages.0.jsonl"), "r", encoding="utf-8") as f:
+            entries = [json.loads(ln) for ln in f if ln.strip()]
+        status_entries = [e for e in entries if e.get("type") == "DeliveryStatus" and e.get("message_id") == pkt.get("id")]
+        assert status_entries
+        assert status_entries[-1].get("ts") == now
+
+        await db.close()
+
+    asyncio.run(_run())

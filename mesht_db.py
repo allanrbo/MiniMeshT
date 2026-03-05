@@ -177,8 +177,7 @@ class MeshtDb:
                 if sender is None:
                     return
                 hex_id = f"{sender & 0xFFFFFFFF:08x}"
-                rx_time = pkt.get("rx_time")
-                ts = rx_time if rx_time else int(time.time())
+                ts = self._normalize_rx_time(pkt.get("rx_time"))
                 node = self._node_info.setdefault(hex_id, NodeInfo(hex_id))
                 node.last_heard = ts
                 rx_snr = pkt.get("rx_snr")
@@ -206,6 +205,18 @@ class MeshtDb:
     def lora_config(self):
         return self._last_lora
 
+    def _normalize_rx_time(self, rx_time):
+        # Prefer packet rx_time unless it is obviously unusable.
+        now = int(time.time())
+        if not isinstance(rx_time, (int, float)):
+            return now
+        ts = int(rx_time)
+        if ts <= 0:
+            return now
+        if ts > now + 300:
+            return now
+        return ts
+
     def _update_delivery_status_from_routing_packet(self, pkt):
         # Parse routing result and append an immutable delivery-status event.
         delivery = parse_delivery_packet(pkt)
@@ -227,7 +238,7 @@ class MeshtDb:
             return
 
         # Persist an immutable status event in append-only form.
-        ts = int(event_ts) if event_ts else int(time.time())
+        ts = self._normalize_rx_time(event_ts)
         entry = {
             "type": "DeliveryStatus",
             "message_id": int(message_id),
@@ -391,7 +402,7 @@ class MeshtDb:
 
     def _make_fromradio_entry(self, fr, raw):
         pkt = fr.get("packet") or {}
-        rx_time = pkt.get("rx_time")
+        ts = self._normalize_rx_time(pkt.get("rx_time"))
         sender = pkt.get("from")
         # Resolve names from node_info cache for readability in the jsonl file
         sender_hex = f"{sender & 0xFFFFFFFF:08x}"
@@ -405,8 +416,8 @@ class MeshtDb:
         return {
             "type": "FromRadio",
             "from": sender_hex,
-            "ts": rx_time if rx_time else int(time.time()),
-            "tsh": _fmt_ts(rx_time if rx_time else int(time.time())),
+            "ts": ts,
+            "tsh": _fmt_ts(ts),
             "text": text,
             "sender_short_name": short_name,
             "sender_long_name": long_name,
@@ -536,7 +547,7 @@ class MeshtDb:
             node.rx_rssi = rx_rssi
         rx_time = packet.get("rx_time")
         if rx_time is not None:
-            node.last_heard = rx_time
+            node.last_heard = self._normalize_rx_time(rx_time)
 
         decoded = packet.get("decoded") or {}
         payload = decoded.get("payload")
