@@ -8,6 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import pb
+from delivery_status import delivery_status_text
 from mesht_device import TORADIO_SCHEMA, FROMRADIO_SCHEMA, PORTNUMS, Channel, USER_SCHEMA
 from packet_parsing import parse_text_packet, parse_delivery_packet, direct_peer_hex
 
@@ -329,7 +330,7 @@ class MeshtDb:
         node_hex = (node_id or "").lower()
         path = self._direct_messages_path(node_hex)
         lines = _load_jsonl(path)
-        messages = self._filter_text_entries(lines)
+        messages = self._filter_text_entries(lines, direct_peer_hex=node_hex)
         key_events = self._build_key_events(node_hex)
         combined = []
         order = 0
@@ -458,7 +459,7 @@ class MeshtDb:
         node_hex = (node_hex or "").lower()
         return os.path.join(self.data_dir, f"messages.dm.{node_hex}.jsonl")
 
-    def _filter_text_entries(self, lines):
+    def _filter_text_entries(self, lines, direct_peer_hex=None):
         out = []
         status_state_by_message_id = {}
 
@@ -477,11 +478,13 @@ class MeshtDb:
             if st is None:
                 st = {
                     "saw_failed": False,
+                    "failed_error_reason": None,
                     "ack_nodes": set(),
                 }
                 status_state_by_message_id[mid] = st
             if status == "failed":
                 st["saw_failed"] = True
+                st["failed_error_reason"] = entry.get("error_reason")
             elif status == "ack":
                 sender_hex = (entry.get("from") or "").lower()
                 if sender_hex:
@@ -507,17 +510,27 @@ class MeshtDb:
                 message_id = entry.get("message_id")
                 resolved = "waiting"
                 ack_count = 0
+                ack_nodes = set()
+                error_reason = None
                 if message_id is not None:
                     st = status_state_by_message_id.get(int(message_id))
                     if st is not None:
-                        ack_count = len(st.get("ack_nodes") or set())
+                        ack_nodes = st.get("ack_nodes") or set()
+                        ack_count = len(ack_nodes)
                         if ack_count > 0:
                             resolved = "ack"
                         elif st.get("saw_failed"):
                             resolved = "failed"
+                            error_reason = st.get("failed_error_reason")
                 text_entry = dict(entry)
                 text_entry["delivery_status"] = resolved
                 text_entry["delivery_ack_count"] = ack_count
+                text_entry["delivery_status_text"] = delivery_status_text(
+                    resolved,
+                    ack_nodes=ack_nodes,
+                    direct_peer_hex=direct_peer_hex,
+                    error_reason=error_reason,
+                )
                 out.append(text_entry)
                 continue
 

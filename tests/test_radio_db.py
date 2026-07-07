@@ -644,6 +644,7 @@ def test_meshtdb_updates_sent_message_status_to_ack(tmp_path):
         assert resolved
         assert resolved[-1].get("delivery_status") == "ack"
         assert resolved[-1].get("delivery_ack_count") == 1
+        assert resolved[-1].get("delivery_status_text") == "Delivered to mesh"
 
         await db.close()
 
@@ -707,6 +708,7 @@ def test_meshtdb_updates_sent_message_status_to_failed(tmp_path):
         assert resolved
         assert resolved[-1].get("delivery_status") == "failed"
         assert resolved[-1].get("delivery_ack_count") == 0
+        assert resolved[-1].get("delivery_status_text") == "Channel/key mismatch"
 
         await db.close()
 
@@ -790,6 +792,7 @@ def test_meshtdb_channel_ack_count_dedupes_nodes(tmp_path):
         assert resolved
         assert resolved[-1].get("delivery_status") == "ack"
         assert resolved[-1].get("delivery_ack_count") == 2
+        assert resolved[-1].get("delivery_status_text") == "Delivered to mesh"
 
         await db.close()
 
