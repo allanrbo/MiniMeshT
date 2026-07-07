@@ -702,20 +702,8 @@ async def main_async(args):
             status_suffix = ""
             if msg.get("type") == "ToRadio":
                 name = msg.get("sender_long_name") or msg.get("sender_short_name") or my_display_name()
-                status = (msg.get("delivery_status") or "waiting").lower()
-                if status == "ack":
-                    if is_direct:
-                        status_suffix = "  [ACK]"
-                    else:
-                        ack_count = int(msg.get("delivery_ack_count") or 0)
-                        if ack_count > 0:
-                            status_suffix = f"  [{ack_count} ACK]"
-                        else:
-                            status_suffix = "  [ACK]"
-                elif status == "failed":
-                    status_suffix = "  [FAILED]"
-                else:
-                    status_suffix = "  [WAITING]"
+                status_text = msg.get("delivery_status_text") or "Sending..."
+                status_suffix = f"  {status_text}"
             else:
                 sender = msg.get("from")
                 name = resolve_sender_name(sender, msg)
@@ -791,7 +779,7 @@ async def main_async(args):
                                         ui.add_message(f"{name}: {text}", ts_epoch=ts if ts else None)
                                         needs_redraw.set()
                         elif parse_delivery_packet(pkt) is not None:
-                            # Routing updates can change [WAITING]/[ACK]/[FAILED] on sent messages.
+                            # Routing updates can change the status text on sent messages.
                             reload_chat_messages()
                             needs_redraw.set()
                         # While viewing nodes, reflect last-heard changes promptly

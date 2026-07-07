@@ -173,6 +173,7 @@ import os
 from mesht_device import MeshtDevice
 from mesht_db import MeshtDb
 from packet_parsing import parse_text_packet, parse_delivery_packet, is_dm_for
+from delivery_status import delivery_status_text
 from transport_serial import SerialTransport
 
 
@@ -218,7 +219,13 @@ async def run():
                 request_id = delivery.request_id
                 if request_id in pending:
                     peer_hex = pending.pop(request_id)
-                    status = (delivery.status or "").upper()
+                    ack_nodes = {delivery.reporter_hex} if delivery.reporter_hex else set()
+                    status = delivery_status_text(
+                        delivery.status,
+                        ack_nodes=ack_nodes,
+                        direct_peer_hex=peer_hex,
+                        error_reason=delivery.error_reason,
+                    )
                     print(f"Delivery for {request_id} to {peer_hex}: {status}")
 
             # Handle incoming direct text packets.
